@@ -44,6 +44,11 @@ def summarize(plan):
             print(f"  组 {g['group_id']:>2} [待救援    ] "
                   f"滞留于已走前缀（{g['prefix_step_count']} 段，"
                   f"通道序列 {g['route']}）原因 {g['reason']}：{g['detail']}")
+        elif g["status"] == "blocked":
+            basis = g.get("release_basis") or {}
+            print(f"  组 {g['group_id']:>2} [前置未满足] "
+                  f"先导 {g['leader_group_id']} 间隔 {g['release_gap']} "
+                  f"({basis.get('reason')})，不占通道")
         else:
             print(f"  组 {g['group_id']:>2} [{g['status']:>9}] "
                   f"原因 {g['reason']}：{g['detail']}")
@@ -306,6 +311,87 @@ if __name__ == "__main__":
     show("重复结案（预期 409 TASK_ALREADY_COMPLETED）", status, payload)
     status, payload = call("GET", "/rescue-tasks/999999")
     show("未知任务号（预期 404）", status, payload)
+
+    # ---- 先导组关系与非负放行间隔 ----
+    # 双路场景：1->2(4)->6(2) 与 1->4(3)->6(2)
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+            {"id": 3, "src": 1, "dst": 4, "minutes": 3, "capacity": 10},
+            {"id": 4, "src": 4, "dst": 6, "minutes": 2, "capacity": 10},
+        ],
+        "exits": [6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 20, "deadline": 30},
+        ],
+    })
+    assert status == 200
+
+    # 组2 以组1 为先导、放行间隔 3：依赖顺序使组1 先安排，组2 最早放行
+    # = 先导规划到达分钟 5 + 3 = 8
+    status, plan = call("POST", "/group-prerequisites",
+                        {"group_id": 2, "leader_group_id": 1,
+                         "release_gap": 3})
+    show("登记先导关系（组2->组1，间隔3，按依赖顺序安排）", status, plan)
+    summarize(plan)
+    g2 = next(g for g in plan["groups"] if g["group_id"] == 2)
+    print(f"  放行依据： basis={g2['release_basis']['basis_type']} "
+          f"先导到达 {g2['release_basis']['leader_arrival_minute']} "
+          f"最早放行 {g2['release_basis']['earliest_release_minute']}")
+
+    status, payload = call("GET", "/group-prerequisites")
+    show("查询全部先导关系及实时放行依据", status, payload)
+
+    # 再次登记替换旧关系（间隔 3 -> 0），修订 detail.replaced 记录旧关系
+    status, plan = call("POST", "/group-prerequisites",
+                        {"group_id": 2, "leader_group_id": 1,
+                         "release_gap": 0})
+    show("替换旧关系（间隔改为0）", status, plan)
+
+    # 拒绝路径：自依赖 / 成环 / 不存在编号 / 负间隔
+    status, payload = call("POST", "/group-prerequisites",
+                           {"group_id": 2, "leader_group_id": 2,
+                            "release_gap": 0})
+    show("自依赖（预期 409 SELF_DEPENDENCY）", status, payload)
+    status, payload = call("POST", "/group-prerequisites",
+                           {"group_id": 1, "leader_group_id": 2,
+                            "release_gap": 0})
+    show("形成环（预期 409 CYCLE_DETECTED，附环路径）", status, payload)
+    status, payload = call("POST", "/group-prerequisites",
+                           {"group_id": 2, "leader_group_id": 99,
+                            "release_gap": 0})
+    show("先导组不存在（预期 422）", status, payload)
+    status, payload = call("POST", "/group-prerequisites",
+                           {"group_id": 2, "leader_group_id": 1,
+                            "release_gap": -1})
+    show("负放行间隔（预期 422）", status, payload)
+
+    # 先导无可行路线 -> 后继 blocked（前置未满足，不占通道）；先导恢复后转正
+    call("POST", "/group-corrections", [{"group_id": 1, "deadline": 3}])
+    status, plan = call("POST", "/group-prerequisites",
+                        {"group_id": 2, "leader_group_id": 1,
+                         "release_gap": 0})
+    show("先导无可行路线（后继预期 blocked / LEADER_FAILED，不占通道）",
+         status, plan)
+    summarize(plan)
+    status, plan = call("POST", "/group-corrections",
+                        [{"group_id": 1, "deadline": 30}])
+    show("先导恢复可行，后继随重排自动转正", status, plan)
+    summarize(plan)
+
+    # 多级依赖：组3 在节点2，链 3->2->1 按依赖顺序安排
+    call("POST", "/groups", [
+        {"id": 3, "size": 10, "origin": 2, "earliest_departure": 0,
+         "priority": 1, "deadline": 30}])
+    status, plan = call("POST", "/group-prerequisites",
+                        {"group_id": 3, "leader_group_id": 2,
+                         "release_gap": 1})
+    show("多级关系（组3->组2->组1，按依赖顺序安排）", status, plan)
+    summarize(plan)
 
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")

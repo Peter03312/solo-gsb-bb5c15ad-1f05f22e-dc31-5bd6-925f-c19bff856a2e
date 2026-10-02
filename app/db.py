@@ -81,6 +81,16 @@ CREATE TABLE IF NOT EXISTS delay_reports (
     prefix_step_count INTEGER NOT NULL
 );
 
+-- 先导关系（放行前置）：每个未出发组至多一项（UPSERT 覆盖）。
+-- leader_group_id 为先导组编号，release_gap 为非负放行间隔：后继组的可
+-- 出发分钟不早于自身最早出发分钟及"先导组规划到达分钟 + 间隔"（先导组
+-- 已人工救援送达时改用实际送达分钟）。成环与自依赖由服务层在登记时拒绝。
+CREATE TABLE IF NOT EXISTS group_prerequisites (
+    group_id        INTEGER PRIMARY KEY,
+    leader_group_id INTEGER NOT NULL,
+    release_gap     INTEGER NOT NULL
+);
+
 -- 人工救援队：按唯一编号登记，capacity 为正整数载员量。
 -- 队伍是否空闲由 rescue_tasks 中是否存在该队 in_progress 任务决定。
 CREATE TABLE IF NOT EXISTS rescue_teams (
@@ -117,6 +127,7 @@ CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
                                       -- closures | capacity-controls |
+                                      -- group-prerequisites |
                                       -- delay-reports | rescue-dispatches |
                                       -- rescue-completions | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
@@ -140,9 +151,11 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    # 人工救援队与其救援任务随场景重置清空；修订历史不在清空之列
+    # 人工救援队与其救援任务随场景重置清空；先导关系亦清空；修订历史不在
+    # 清空之列
     for table in ("rescue_tasks", "rescue_teams",
-                  "delay_reports", "route_steps", "groups", "closures",
+                  "delay_reports", "group_prerequisites",
+                  "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
@@ -231,7 +244,8 @@ async def load_world(db: aiosqlite.Connection):
     async with db.execute(
             """SELECT id, size, origin, earliest_departure, priority,
                       deadline, status
-               FROM groups WHERE status IN ('scheduled', 'failed', 'pending')
+               FROM groups WHERE status IN
+                   ('scheduled', 'failed', 'pending', 'blocked')
                ORDER BY priority DESC, earliest_departure ASC, id ASC"""
             ) as cur:
         pending = [dict(zip(
@@ -239,7 +253,24 @@ async def load_world(db: aiosqlite.Connection):
              "priority", "deadline", "status"),
             row)) for row in await cur.fetchall()]
 
-    return world, pending
+    # 全部组当前状态 + 先导到达锚点（规划到达 / 人工实际送达）。未出发组
+    # 的先导若是 scheduled/failed/blocked 或 pending，会在本轮多轮安排中
+    # 先导落定后再就绪；这里只预置已不会在本轮变动的锚点。
+    prerequisites = await load_prerequisites(db)
+    async with db.execute(
+            """SELECT g.id, g.status, g.arrival_minute,
+                      rt.delivery_minute
+               FROM groups g
+               LEFT JOIN rescue_tasks rt
+                      ON rt.group_id = g.id AND rt.status='completed'"""
+            ) as cur:
+        states: dict[int, dict] = {}
+        for gid, status, arrival, delivery in await cur.fetchall():
+            states[gid] = {"status": status,
+                           "arrival_minute": arrival,
+                           "delivery_minute": delivery}
+
+    return world, pending, prerequisites, states
 
 
 async def load_fixed_routes(db: aiosqlite.Connection):
@@ -293,11 +324,20 @@ async def persist_replan(db: aiosqlite.Connection, results: list[dict],
                      step["to_node"], step["enter_minute"],
                      step["exit_minute"]))
         else:
-            await db.execute(
-                """UPDATE groups SET status='failed',
-                   departure_minute=NULL, arrival_minute=NULL, exit_id=NULL,
-                   fail_reason=?, fail_detail=? WHERE id=?""",
-                (r["reason"], r["detail"], gid))
+            status = r.get("status", "failed")
+            if status == "blocked":
+                # 前置未满足：不写入任何路线/占用，原因说明前置状态
+                await db.execute(
+                    """UPDATE groups SET status='blocked',
+                       departure_minute=NULL, arrival_minute=NULL, exit_id=NULL,
+                       fail_reason=?, fail_detail=? WHERE id=?""",
+                    (r["reason"], r["detail"], gid))
+            else:
+                await db.execute(
+                    """UPDATE groups SET status='failed',
+                       departure_minute=NULL, arrival_minute=NULL, exit_id=NULL,
+                       fail_reason=?, fail_detail=? WHERE id=?""",
+                    (r["reason"], r["detail"], gid))
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +381,34 @@ async def upsert_delay_report(db: aiosqlite.Connection, *, group_id: int,
                prefix_step_count=excluded.prefix_step_count""",
         (group_id, node_id, recovery_minute, reported_minute,
          prefix_step_count))
+
+
+# --------------------------------------------------------------------------
+# 先导关系（放行前置）
+# --------------------------------------------------------------------------
+
+async def load_prerequisites(db: aiosqlite.Connection
+                             ) -> dict[int, dict]:
+    """返回 group_id -> {"leader_group_id", "release_gap"}（每组至多一项）。"""
+    async with db.execute(
+            "SELECT group_id, leader_group_id, release_gap "
+            "FROM group_prerequisites") as cur:
+        return {gid: {"leader_group_id": leader, "release_gap": gap}
+                for gid, leader, gap in await cur.fetchall()}
+
+
+async def upsert_prerequisite(db: aiosqlite.Connection, *, group_id: int,
+                              leader_group_id: int,
+                              release_gap: int) -> None:
+    """登记/替换一组的先导关系（调用方负责事务与全部校验）。"""
+    await db.execute(
+        """INSERT INTO group_prerequisites(group_id, leader_group_id,
+                                           release_gap)
+           VALUES(?,?,?)
+           ON CONFLICT(group_id) DO UPDATE SET
+               leader_group_id=excluded.leader_group_id,
+               release_gap=excluded.release_gap""",
+        (group_id, leader_group_id, release_gap))
 
 
 # --------------------------------------------------------------------------

@@ -26,6 +26,15 @@
   滞留报告对其拒绝）。结案须给出既有出口与不早于派遣、不晚于当前分钟的
   实际送达分钟：核销后队伍空闲、组置已救援，实际出口与时刻单列，
   不当作规划到达。无效编号、状态/时序冲突与并发抢占均整次拒绝。
+* 现场可为尚未出发的组登记先导组及非负放行间隔（每组至多一项，再次
+  登记替换旧关系）：先导组须存在，禁止自依赖和成环，目标组已出发、
+  编号或间隔无效、形成环时整次拒绝。后继组的可出发分钟不早于自身最早
+  出发分钟及先导组规划到达分钟加间隔；先导已人工救援送达时改用实际
+  送达分钟，待救援、救援中或无可行路线时后继标记前置未满足（blocked，
+  不占通道）。多级关系按依赖顺序安排，每轮在可安排组中沿用现有优先级、
+  最早出发分钟、组编号与路线并列规则。关系变更、时间推进、现场滞留及
+  救援结案后立即重排未出发组，已出发组路线及既有放行决定不追溯；成功
+  登记与编排修订在同一事务原子落库。
 
 修订历史
 ========
@@ -52,7 +61,9 @@ from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
                       DelayReportAliasIn, DelayReportIn, GroupChangeOut,
                       GroupCorrectionIn, GroupIn, GroupPlanOut,
-                      PlanResponse, RescueCompletionIn, RescueDispatchIn,
+                      PlanResponse, PrerequisiteBasisOut, PrerequisiteIn,
+                      PrerequisiteListOut, PrerequisiteOut,
+                      RescueCompletionIn, RescueDispatchIn,
                       RescueTaskListOut, RescueTaskOut, RescueTeamIn,
                       RescueTeamListOut, RescueTeamOut, RevisionDetailOut,
                       RevisionListOut, RevisionSummaryOut, ScenarioIn,
@@ -88,9 +99,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.3.0",
+    version="1.4.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
+                "先导组放行间隔（多级依赖按依赖顺序安排）、"
                 "现场节点滞留报告与人工救援队交接核销。",
     lifespan=lifespan,
 )
@@ -155,15 +167,80 @@ async def _load_scenario(conn: aiosqlite.Connection,
     return after
 
 
+# 先导前置未满足（blocked 状态，不占通道）的原因码与说明。后继组在先导
+# 组没有可用到达锚点（规划到达或人工实际送达）时标记前置未满足，并随先导
+# 状态/编排变化在后续重排中转正。
+PREREQUISITE_NOT_SATISFIED = "PREREQUISITE_NOT_SATISFIED"
+
+_BLOCKED_REASONS = {
+    "LEADER_PENDING":
+        "先导组 {leader} 尚未安排出截止前可行路线（{leader_state}），"
+        "放行前置未满足，暂不安排、不占用通道",
+    "LEADER_AWAITING_RESCUE":
+        "先导组 {leader} 已滞留待救援，尚无规划到达分钟，放行前置未满足，"
+        "暂不安排、不占用通道",
+    "LEADER_RESCUING":
+        "先导组 {leader} 正在人工救援中，尚无实际送达分钟，放行前置未满足，"
+        "暂不安排、不占用通道",
+    "LEADER_FAILED":
+        "先导组 {leader} 无法在截止前安排（{leader_reason}），"
+        "没有可用的规划到达分钟，放行前置未满足，暂不安排、不占用通道",
+    "LEADER_BLOCKED":
+        "先导组 {leader} 的放行前置未满足，依赖沿多级关系向上传递，"
+        "本组暂不安排、不占用通道",
+}
+
+
+def _blocked_result(group_id: int, reason: str, **fmt) -> dict:
+    """构造"前置未满足"的编排结果（blocked，无路线、无占用）。"""
+    return {"group_id": group_id, "status": "blocked",
+            "reason": reason, "detail": _BLOCKED_REASONS[reason].format(**fmt)}
+
+
+def _leader_anchor(state: dict | None):
+    """先导组当前能否给后继提供放行锚点。
+
+    返回 (kind, arrival_minute)：
+    * ("ok", minute)  —— scheduled/fixed 的规划到达，或 rescued 的实际送达；
+    * ("failed", None)——先导编排失败（截止前无可行路线）；
+    * ("block", reason, None) —— 前置未满足（待安排/待救援/救援中/自身前置
+      未满足），reason 为对应的 LEADER_* 原因码。
+    """
+    if state is None:
+        return "block", "LEADER_PENDING", None
+    status = state["status"]
+    if status in ("scheduled", "fixed") and state["arrival_minute"] is not None:
+        return "ok", state["arrival_minute"]
+    if status == "rescued" and state["delivery_minute"] is not None:
+        return "ok", state["delivery_minute"]
+    if status == "failed":
+        return "failed", None
+    if status == "awaiting_rescue":
+        return "block", "LEADER_AWAITING_RESCUE", None
+    if status == "rescuing":
+        return "block", "LEADER_RESCUING", None
+    if status == "blocked":
+        return "block", "LEADER_BLOCKED", None
+    # pending / scheduled 但尚无到达分钟：先导还在本轮待安排
+    return "block", "LEADER_PENDING", None
+
+
 async def _replan_pending(conn: aiosqlite.Connection,
                           in_transaction: bool = False) -> None:
-    """重排全部未出发组（scheduled/failed/pending），整体替换。
+    """重排全部未出发组，整体替换（多级先导关系按依赖顺序安排）。
+
+    每轮在"先导前置已满足"的可安排组中，沿用既有 优先级 DESC、最早出发
+    ASC、组编号 ASC、路线并列规则逐组贪婪安排；先导尚无可用到达锚点（未
+    安排/待救援/救援中/无可行路线/先导自身前置未满足）的后继标记
+    ``blocked``（前置未满足，不写路线、不占通道），并在先导落定后的后续
+    轮次转正。已固定（fixed）与已人工送达（rescued）的先导分别提供规划
+    到达分钟与实际送达分钟作为放行锚点。
 
     读阶段在事务外完成（SQLite autocommit 下读到的是最近一致快照），
     写阶段整体置于一个事务中，杜绝部分重排。
     """
     minute_now = await db.get_current_minute(conn)
-    world, pending = await db.load_world(conn)
+    world, pending, prerequisites, db_states = await db.load_world(conn)
 
     node_set: set[int] = set()
     for e in world.edges.values():
@@ -174,24 +251,120 @@ async def _replan_pending(conn: aiosqlite.Connection,
         if g["origin"] not in node_set:
             raise HTTPException(422, f"组 {g['id']} 的起点 {g['origin']} 不连通")
 
-    results = []
-    # 已按 优先级 DESC, 最早出发 ASC, 组编号 ASC 排序
-    for g in pending:
-        result = plan_group(
-            group_id=g["id"], size=g["size"], origin=g["origin"],
-            earliest_departure=g["earliest_departure"],
-            deadline=g["deadline"], current_minute=minute_now, world=world)
-        results.append(result)
-        if result["status"] == "scheduled":
-            for (eid, minute), add in result["load_delta"].items():
-                key = (eid, minute)
-                world.fixed_load[key] = world.fixed_load.get(key, 0) + add
+    # 本轮待安排组：id -> 属性；states 持续记录先导/后继的落定结果
+    todo = {g["id"]: g for g in pending}
+    states: dict[int, dict] = {}
+    # 已不会在本轮变动的组（fixed/awaiting_rescue/rescuing/rescued）预置锚点
+    for gid, st in db_states.items():
+        if gid not in todo and st["status"] in (
+                "fixed", "awaiting_rescue", "rescuing", "rescued"):
+            states[gid] = st
+
+    results: dict[int, dict] = {}
+    while todo:
+        progressed = False
+
+        # 1) 先导已在前面轮次落定且未提供可用锚点的后继，标记前置未满足。
+        #    立即写入 states，使多级依赖的阻塞在本轮沿链传播到不动点。
+        changed = True
+        while changed:
+            changed = False
+            for gid in sorted(todo):
+                pre = prerequisites.get(gid)
+                if pre is None:
+                    continue
+                leader = pre["leader_group_id"]
+                if leader in todo:
+                    continue  # 先导尚待本轮安排，等其落定后再判
+                anchor = _leader_anchor(states.get(leader))
+                if anchor[0] == "ok":
+                    continue
+                if anchor[0] == "failed":
+                    fmt = {"leader": leader,
+                           "leader_reason": states.get(leader, {}).get(
+                               "fail_reason", "无可行路线")}
+                    reason = "LEADER_FAILED"
+                else:
+                    fmt, reason = {"leader": leader}, anchor[1]
+                results[gid] = _blocked_result(gid, reason, **fmt)
+                states[gid] = {
+                    "status": "blocked", "arrival_minute": None,
+                    "delivery_minute": None,
+                    "fail_reason": PREREQUISITE_NOT_SATISFIED}
+                del todo[gid]
+                changed = progressed = True
+
+        if not todo:
+            break
+
+        # 2) 收集本轮可安排组：无先导，或先导已有可用到达锚点
+        ready = []
+        for g in todo.values():
+            pre = prerequisites.get(g["id"])
+            if pre is None:
+                ready.append((g, None, 0))
+                continue
+            anchor = _leader_anchor(states.get(pre["leader_group_id"]))
+            if anchor[0] == "ok":
+                ready.append((g, anchor[1], pre["release_gap"]))
+
+        if not ready:
+            # 防御：登记时已拒绝成环/自依赖，DAG 下不应到达这里；
+            # 剩余组全部按前置未满足落定，避免死循环
+            for gid in sorted(todo):
+                results[gid] = _blocked_result(gid, "LEADER_PENDING",
+                                               leader="?")
+                states[gid] = {"status": "blocked", "arrival_minute": None,
+                               "delivery_minute": None,
+                               "fail_reason": PREREQUISITE_NOT_SATISFIED}
+            break
+
+        # 可安排组沿用现有优先级、最早出发分钟、组编号并列规则
+        ready.sort(key=lambda item: (-item[0]["priority"],
+                                     item[0]["earliest_departure"],
+                                     item[0]["id"]))
+        for g, leader_arrival, gap in ready:
+            earliest = g["earliest_departure"]
+            if leader_arrival is not None:
+                earliest = max(earliest, leader_arrival + gap)
+            result = plan_group(
+                group_id=g["id"], size=g["size"], origin=g["origin"],
+                earliest_departure=earliest,
+                deadline=g["deadline"], current_minute=minute_now, world=world)
+            results[g["id"]] = result
+            if result["status"] == "scheduled":
+                states[g["id"]] = {
+                    "status": "scheduled",
+                    "arrival_minute": result["arrival_minute"],
+                    "delivery_minute": None}
+                for (eid, minute), add in result["load_delta"].items():
+                    key = (eid, minute)
+                    world.fixed_load[key] = world.fixed_load.get(key, 0) + add
+            else:
+                states[g["id"]] = {"status": "failed",
+                                   "arrival_minute": None,
+                                   "delivery_minute": None,
+                                   "fail_reason": result["reason"]}
+            del todo[g["id"]]
+            progressed = True
+
+        if not progressed:  # 防御：保证循环必然终止
+            for gid in sorted(todo):
+                results[gid] = _blocked_result(gid, "LEADER_PENDING",
+                                               leader="?")
+            break
+
+    # 输出顺序沿用 优先级、最早出发、组编号（与历史 /plan 口径一致）
+    ordered = sorted(results.values(),
+                     key=lambda r: next(
+                         (-g["priority"], g["earliest_departure"], g["id"])
+                         for g in pending if g["id"] == r["group_id"]))
 
     if in_transaction:
-        await db.persist_replan(conn, results, minute_now)
+        await db.persist_replan(conn, ordered, minute_now)
     else:
         async with db.transaction(conn):
-            await db.persist_replan(conn, results, minute_now)
+            await db.persist_replan(conn, ordered, minute_now)
 
 
 async def _closure_conflicts(conn: aiosqlite.Connection, edge_id: int,
@@ -445,7 +618,7 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
 
         # 2) 以滞留节点为起点、恢复分钟为最早出发重找余程。此时 world 的
         #    固定占用含其他已出发组（本组旧余程已删除，不会重复计数）
-        world, _pending = await db.load_world(conn)
+        world, _pending, _pre, _states = await db.load_world(conn)
         if recovery_minute > deadline:
             result = {
                 "group_id": group_id,
@@ -514,12 +687,14 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
     minute_now = await db.get_current_minute(conn)
     prefix_by_group = await db.load_delay_prefixes(conn)
     rescue_by_group = await db.load_group_rescue_map(conn)
+    prerequisites = await db.load_prerequisites(conn)
     async with conn.execute(
             """SELECT id, status, departure_minute, arrival_minute, exit_id,
                       fail_reason, fail_detail
                FROM groups ORDER BY priority DESC,
                     earliest_departure ASC, id ASC""") as cur:
         group_rows = await cur.fetchall()
+    group_index = {row[0]: row for row in group_rows}
     out = []
     for gid, status, dep, arr, exit_id, reason, detail in group_rows:
         steps = []
@@ -531,6 +706,19 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
                     edge_id=row[0], from_node=row[1], to_node=row[2],
                     enter_minute=row[3], exit_minute=row[4]))
         rescue = rescue_by_group.get(gid, {})
+        pre = prerequisites.get(gid)
+        basis = None
+        if pre is not None:
+            basis = _build_release_basis(
+                pre["leader_group_id"], pre["release_gap"], group_index,
+                rescue_by_group)
+            # blocked 组的前置说明按先导当前状态实时给出（派遣不触发重排，
+            # 落库 detail 可能仍是更早的待救援说明）
+            if status == "blocked" and not basis.satisfied:
+                detail = _BLOCKED_REASONS[basis.reason].format(
+                    leader=pre["leader_group_id"],
+                    leader_reason=_leader_fail_reason(
+                        pre["leader_group_id"], group_index))
         out.append(GroupPlanOut(
             group_id=gid, status=status, exit_id=exit_id,
             departure_minute=dep, arrival_minute=arr,
@@ -540,8 +728,67 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
             rescue_task_id=rescue.get("rescue_task_id"),
             rescue_team_id=rescue.get("rescue_team_id"),
             rescued_exit_id=rescue.get("rescued_exit_id"),
-            delivery_minute=rescue.get("delivery_minute")))
+            delivery_minute=rescue.get("delivery_minute"),
+            leader_group_id=(pre or {}).get("leader_group_id"),
+            release_gap=(pre or {}).get("release_gap"),
+            release_basis=basis))
     return PlanResponse(current_minute=minute_now, groups=out)
+
+
+def _leader_fail_reason(leader_id: int, group_index: dict[int, tuple]) -> str:
+    row = group_index.get(leader_id)
+    if row is not None and row[5]:  # fail_reason
+        return row[5]
+    return "无可行路线"
+
+
+def _build_release_basis(leader_id: int, gap: int,
+                         group_index: dict[int, tuple],
+                         rescue_by_group: dict[int, dict]
+                         ) -> PrerequisiteBasisOut:
+    """实时计算一组先导关系当前的放行依据。
+
+    先导为 scheduled/fixed 取规划到达分钟（basis_type=planned_arrival）；
+    先导已人工救援送达（rescued）取实际送达分钟（basis_type=
+    actual_delivery）；先导待救援、救援中、尚未安排、编排失败或自身前置
+    未满足时 satisfied=false 并给出原因码，最早放行分钟为空。
+    """
+    row = group_index.get(leader_id)
+    if row is None:
+        return PrerequisiteBasisOut(
+            satisfied=False, basis_type=None, leader_status="unknown",
+            reason="LEADER_PENDING")
+    leader_status, _dep, arrival = row[1], row[2], row[3]
+    rescue = rescue_by_group.get(leader_id, {})
+    if leader_status in ("scheduled", "fixed") and arrival is not None:
+        return PrerequisiteBasisOut(
+            satisfied=True, basis_type="planned_arrival",
+            leader_status=leader_status, leader_arrival_minute=arrival,
+            earliest_release_minute=arrival + gap)
+    if leader_status == "rescued":
+        delivery = rescue.get("delivery_minute")
+        if delivery is not None:
+            return PrerequisiteBasisOut(
+                satisfied=True, basis_type="actual_delivery",
+                leader_status=leader_status,
+                leader_arrival_minute=delivery,
+                earliest_release_minute=delivery + gap)
+        return PrerequisiteBasisOut(
+            satisfied=False, basis_type=None, leader_status=leader_status,
+            reason="LEADER_RESCUING")
+    if leader_status == "awaiting_rescue":
+        reason = "LEADER_AWAITING_RESCUE"
+    elif leader_status == "rescuing":
+        reason = "LEADER_RESCUING"
+    elif leader_status == "failed":
+        reason = "LEADER_FAILED"
+    elif leader_status == "blocked":
+        reason = "LEADER_BLOCKED"
+    else:  # pending / scheduled 但尚无到达分钟
+        reason = "LEADER_PENDING"
+    return PrerequisiteBasisOut(
+        satisfied=False, basis_type=None, leader_status=leader_status,
+        reason=reason)
 
 
 def _plan_dump(plan: PlanResponse) -> dict:
@@ -554,7 +801,8 @@ _GROUP_DIFF_FIELDS = ("status", "exit_id", "departure_minute",
                       "arrival_minute", "route", "steps",
                       "prefix_step_count", "reason", "detail",
                       "rescue_task_id", "rescue_team_id",
-                      "rescued_exit_id", "delivery_minute")
+                      "rescued_exit_id", "delivery_minute",
+                      "leader_group_id", "release_gap", "release_basis")
 
 
 def _diff_plans(before: PlanResponse,
@@ -893,6 +1141,174 @@ async def list_capacity_controls(request: Request):
 
 
 # --------------------------------------------------------------------------
+# 先导关系（放行前置）
+# --------------------------------------------------------------------------
+
+# 目标组已出发（fixed/awaiting_rescue/rescuing/rescued）时不可再登记
+_DEPARTED_STATUSES = ("fixed", "awaiting_rescue", "rescuing", "rescued")
+
+
+def _prerequisite_conflict(reason: str, message: str,
+                           payload: PrerequisiteIn, minute_now: int,
+                           *, target_status: str | None = None,
+                           extra: dict | None = None) -> JSONResponse:
+    """构造统一的先导关系登记拒绝响应（HTTP 409）。"""
+    conflict = {"group_id": payload.group_id,
+                "leader_group_id": payload.leader_group_id,
+                "release_gap": payload.release_gap,
+                "current_minute": minute_now, "reason": reason}
+    if target_status is not None:
+        conflict["status"] = target_status
+    if extra:
+        conflict.update(extra)
+    return JSONResponse(
+        status_code=409,
+        content={"error": "PREREQUISITE_NOT_ACCEPTABLE",
+                 "message": message, "conflicts": [conflict]})
+
+
+def _prerequisite_cycle(graph: dict[int, int], target: int,
+                        leader: int) -> list[int]:
+    """在假设 target -> leader 下检测成环；成环时返回环上的组号序列。
+
+    自依赖（leader == target）返回 [target, target]。沿 leader 链自后继
+    向上游走，回到 target 即成环（每组至多一个先导，链唯一）。
+    """
+    if leader == target:
+        return [target, target]
+    path = [leader]
+    node = leader
+    seen = {leader}
+    while node in graph:
+        node = graph[node]
+        path.append(node)
+        if node == target:
+            return [target] + path
+        if node in seen:
+            return []  # 既有关系里已有环，登记接口不会产生这种数据
+        seen.add(node)
+    return []
+
+
+@app.post("/group-prerequisites", tags=["先导关系"],
+          response_model=PlanResponse, status_code=201,
+          responses={
+              409: {"description": "目标组已出发/自依赖/形成环，整次拒绝"},
+              422: {"description": "目标组或先导组编号不存在、间隔为负"}})
+async def register_prerequisite(payload: PrerequisiteIn, request: Request):
+    """现场为**尚未出发**的人群组登记先导组与非负放行间隔。
+
+    同一组至多一项关系：再次登记替换旧关系（组号或间隔无效、目标组已
+    出发或形成环时整次拒绝，旧关系与修订历史不变）。先导组必须存在，
+    禁止自依赖和成环（含多级关系形成的环）。
+
+    登记成功后立即重排全部未出发组：后继组的可出发分钟不早于自身最早
+    出发分钟及"先导组规划到达分钟 + 间隔"；先导组已由人工救援送达时
+    改用实际送达分钟；先导待救援、救援中或无可行路线（含先导自身前置
+    未满足）时后继标记 ``blocked``（前置未满足，不占通道），待先导落
+    定后的后续重排中转正。多级关系按依赖顺序安排，每轮在可安排组中沿
+    用现有优先级、最早出发分钟、组编号与路线并列规则。成功登记原子写
+    入一条 ``group-prerequisites`` 修订，返回完整编排。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                "SELECT id, status FROM groups") as cur:
+            group_rows = await cur.fetchall()
+        group_status = {gid: status for gid, status in group_rows}
+
+        if payload.group_id not in group_status:
+            raise HTTPException(
+                422, f"目标人群组 {payload.group_id} 不存在")
+        if payload.leader_group_id not in group_status:
+            raise HTTPException(
+                422, f"先导组 {payload.leader_group_id} 不存在")
+        target_status = group_status[payload.group_id]
+        if target_status in _DEPARTED_STATUSES:
+            return _prerequisite_conflict(
+                "TARGET_ALREADY_DEPARTED",
+                "目标组已出发，先导关系不可再登记，整次拒绝",
+                payload, minute_now, target_status=target_status)
+
+        prerequisites = await db.load_prerequisites(conn)
+        # 以"替换旧关系"后的图做环检测：先移除目标组当前的出边
+        graph = {gid: pre["leader_group_id"]
+                 for gid, pre in prerequisites.items()}
+        graph.pop(payload.group_id, None)
+        cycle = _prerequisite_cycle(
+            graph, payload.group_id, payload.leader_group_id)
+        if cycle:
+            if cycle == [payload.group_id, payload.group_id]:
+                reason, message = (
+                    "SELF_DEPENDENCY",
+                    "先导组不能是目标组自身，禁止自依赖，整次拒绝")
+            else:
+                reason, message = (
+                    "CYCLE_DETECTED",
+                    "登记后先导关系将形成环，多级依赖禁止成环，整次拒绝")
+            return _prerequisite_conflict(
+                reason, message, payload, minute_now,
+                target_status=target_status,
+                extra={"cycle": cycle} if reason == "CYCLE_DETECTED" else None)
+
+        before = await _build_plan_response(conn)
+        old = prerequisites.get(payload.group_id)
+        async with db.transaction(conn):
+            await db.upsert_prerequisite(
+                conn, group_id=payload.group_id,
+                leader_group_id=payload.leader_group_id,
+                release_gap=payload.release_gap)
+            await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            detail = {"group_id": payload.group_id,
+                      "leader_group_id": payload.leader_group_id,
+                      "release_gap": payload.release_gap}
+            if old is not None:
+                detail["replaced"] = {
+                    "leader_group_id": old["leader_group_id"],
+                    "release_gap": old["release_gap"]}
+            await db.insert_revision(
+                conn, "group-prerequisites", detail,
+                _plan_dump(before), _plan_dump(after))
+        return after
+
+
+@app.get("/group-prerequisites", tags=["先导关系"],
+         response_model=PrerequisiteListOut)
+async def list_prerequisites(request: Request):
+    """列出当前全部先导关系及其放行依据（按目标组编号升序）。
+
+    每项给出目标组、先导组、非负放行间隔，以及实时计算的放行依据：
+    先导状态、采用的到达分钟（规划到达 / 人工实际送达）与后继最早放行
+    分钟；先导待救援、救援中、尚未安排或无可行路线时标记前置未满足及
+    原因。场景重置清空全部关系。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        prerequisites = await db.load_prerequisites(conn)
+        async with conn.execute(
+                """SELECT id, status, departure_minute, arrival_minute,
+                          exit_id, fail_reason, fail_detail
+                   FROM groups ORDER BY id""") as cur:
+            group_index = {row[0]: row for row in await cur.fetchall()}
+        rescue_by_group = await db.load_group_rescue_map(conn)
+        relations = []
+        for gid in sorted(prerequisites):
+            pre = prerequisites[gid]
+            relations.append(PrerequisiteOut(
+                group_id=gid,
+                leader_group_id=pre["leader_group_id"],
+                release_gap=pre["release_gap"],
+                release_basis=_build_release_basis(
+                    pre["leader_group_id"], pre["release_gap"],
+                    group_index, rescue_by_group)))
+    return PrerequisiteListOut(current_minute=minute_now,
+                               relations=relations)
+
+
+# --------------------------------------------------------------------------
 # 现场节点滞留报告
 # --------------------------------------------------------------------------
 
@@ -1155,10 +1571,15 @@ async def _apply_rescue_completion(conn: aiosqlite.Connection,
             conn, task_id=task_id, exit_id=payload.exit_id,
             delivery_minute=payload.delivery_minute)
         # 组标记已救援：规划到达字段（exit_id/arrival_minute）保持为空，
-        # 人工送达不当作规划到达；实际出口与时刻仅由救援字段单列
+        # 人工送达不当作规划到达；实际出口与时刻仅由救援字段单列。
+        # 旧的规划出发分钟同样清空（待救援前的残留），人工送达时刻以
+        # rescue_tasks.delivery_minute 为准。
         await conn.execute(
-            "UPDATE groups SET status='rescued' WHERE id=?",
-            (task["group_id"],))
+            "UPDATE groups SET status='rescued', departure_minute=NULL "
+            "WHERE id=?", (task["group_id"],))
+        # 结案后立即重排未出发组：以该组为先导的后继改用实际送达分钟作为
+        # 放行锚点（前置未满足的后继随之转正）；已出发组不追溯
+        await _replan_pending(conn, in_transaction=True)
         after = await _build_plan_response(conn)
         await db.insert_revision(
             conn, "rescue-completions",
@@ -1304,7 +1725,8 @@ async def advance_minute(request: Request, payload: TickIn | None = None):
 
     推进时，旧计划中出发分钟已过（< 新当前分钟）的组视为已经出发，
     路线与占用立即固定、不参与重排；其余未出发组再按新当前分钟整体重排
-    （新计划允许在当前分钟立即出发）。被现场报告置为待救援
+    （新计划允许在当前分钟立即出发）。先导前置未满足（blocked）的组仍属
+    未出发，在先导到达锚点可用后随重排转正。被现场报告置为待救援
     （awaiting_rescue）的组、已交接人工救援队（rescuing）与已由人工结案
     送达（rescued）的组均不参与重排：待救援组只能由新的节点滞留报告携带
     新的恢复分钟重新受理；救援中的组由人工救援队结案核销，时间推进不会

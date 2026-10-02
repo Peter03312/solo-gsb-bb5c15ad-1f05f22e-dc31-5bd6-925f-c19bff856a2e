@@ -15,6 +15,11 @@
 **交接派遣**给空闲队伍（校验所见分钟、滞留节点、载员量、队伍空闲），
 随后凭任务号与既有出口、实际送达分钟**结案核销**：成功派遣/结案与编排
 修订在同一事务原子落库，实际出口与时刻单列、不当作规划到达。
+支持现场为尚未出发的组登记**先导组与非负放行间隔**（每组至多一项、再次
+登记替换旧关系）：后继最早出发不早于自身最早出发与"先导规划到达+间隔"，
+先导已人工送达时改用实际送达分钟；先导待救援、救援中或无可行路线时后继
+
+标记**前置未满足**（不占通道），多级关系按依赖顺序安排。
 每次成功的编排变更都会落库一条**全局递增修订**（前后完整快照 + 逐组差异），
 供指挥员追溯"每次疏散变更为何改动编排"。
 
@@ -71,6 +76,8 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/closures` | 新增左闭右开封闭时段；触及已出发组剩余路线则 **409 整次拒绝** |
 | POST | `/capacity-controls` | 登记左闭右开容量管制时段；重叠或使已出发组超载则 **409 整次拒绝** |
 | GET | `/capacity-controls` | 列出当前全部容量管制时段 |
+| POST | `/group-prerequisites` | 为未出发组登记先导组+非负放行间隔（每组一项，再登记替换）；目标已出发、自依赖/成环 **409**，编号或间隔无效 **422** |
+| GET | `/group-prerequisites` | 列出全部先导关系及实时放行依据（先导状态、采用的到达分钟、最早放行分钟） |
 | POST | `/groups/{group_id}/delay-report` | 现场报告已出发组在某节点滞留（按节点+恢复分钟重找余程）；组未出发、节点或时机不符 **409 整次拒绝** |
 | POST | `/rescue-teams` | 登记人工救援队（唯一编号+正整数载员量）；编号重复 **409 整次拒绝** |
 | GET | `/rescue-teams` | 列出全部救援队（载员量、当前进行中任务号） |
@@ -277,8 +284,10 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 `awaiting_rescue`（已出发但现场报告后截止前再无可行余程，待救援；后续
 时间推进不自动重排）、`rescuing`（待救援组已交接人工救援队、救援中；
 保留已走前缀、无未来通道占用、不自动重排）、`rescued`（已由人工救援队
-结案送达；实际出口与时刻单列，不作规划到达）、`failed`（从未出发且无法
-在截止前安排）。
+结案送达；实际出口与时刻单列，不作规划到达）、`blocked`（从未出发但
+先导前置未满足：先导待救援/救援中/尚未安排/无可行路线/先导自身前置未
+满足；不写路线、不占通道，先导落定后随重排自动转正）、`failed`（从未
+出发且在前置已满足时仍无法在截止前安排）。
 
 被人工救援队交接过的组（`rescuing`/`rescued`）在编排中额外给出：
 `rescue_task_id`（救援任务号）、`rescue_team_id`（接手队伍）、
@@ -290,6 +299,17 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 `prefix_step_count`：`steps` 的前 `prefix_step_count` 段为报告时已走完、
 固定保留的**已走前缀**，其后为按恢复分钟重找的**新余程**；未报告组该
 字段恒为 `null`，其余字段与规划语义保持兼容。
+
+登记过先导关系的组额外给出 `leader_group_id`、`release_gap` 与
+`release_basis`（放行依据，实时计算）：`satisfied` 表示先导是否已有可用
+到达锚点；`basis_type` 为 `planned_arrival`（先导 `scheduled`/`fixed`
+的规划到达分钟）或 `actual_delivery`（先导 `rescued` 的人工实际送达
+分钟）；`leader_arrival_minute` 为采用的到达分钟、
+`earliest_release_minute` 为其加间隔后的后继最早放行分钟。前置未满足时
+`satisfied=false` 且 `reason` 为 `LEADER_PENDING` /
+`LEADER_AWAITING_RESCUE` / `LEADER_RESCUING` / `LEADER_FAILED` /
+`LEADER_BLOCKED`，最早放行分钟为 `null`。未登记关系的组这三个字段恒为
+`null`，原有字段语义保持兼容。
 
 失败原因码（`failed` 组的失败原因，或 `awaiting_rescue` 组自滞留节点
 重找余程无解的原因）：
@@ -352,6 +372,67 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 登记成功后仅重排未出发组（已出发组路线与占用保留），返回重排后的
 完整编排（同 GET /plan）。
 
+**POST /group-prerequisites**：为**尚未出发**的人群组登记先导组与非负
+放行间隔。
+
+```json
+{"group_id": 2, "leader_group_id": 1, "release_gap": 3}
+```
+
+* `group_id`：后继（目标）组，必须是**尚未出发**的组
+  （`scheduled`/`failed`/`pending`/`blocked`）；
+* `leader_group_id`：先导组编号，**必须存在**（可以是任意状态的组，
+  含已出发或已救援组）；
+* `release_gap`：**非负整数**放行间隔。同一组至多一项关系，再次登记
+  **替换**旧关系（修订 `detail.replaced` 记录被替换的旧关系）。
+* 后继组的可出发分钟不早于自身最早出发分钟及
+  **先导组规划到达分钟 + 间隔**；先导组已由人工救援队结案送达时改用
+  **实际送达分钟 + 间隔**（放行依据中 `basis_type` 分别为
+  `planned_arrival` / `actual_delivery`）。
+* 先导组待救援、救援中、尚未安排、无可行路线（`failed`）或先导自身前置
+  未满足时，后继标记 **`blocked`（前置未满足）**：不写路线、不占通道，
+  `/plan` 中原因码为 `LEADER_AWAITING_RESCUE` / `LEADER_RESCUING` /
+  `LEADER_PENDING` / `LEADER_FAILED` / `LEADER_BLOCKED`，待先导落定后的
+  下一次重排（关系变更、`/tick`、现场滞留报告、救援结案等触发）自动转正。
+* **多级关系按依赖顺序安排**：先导先于后继得到路线与放行依据；每轮在
+  可安排组中沿用现有优先级、最早出发分钟、组编号与路线并列规则，截止、
+  封闭与容量约束继续生效（前置满足但自身赶不上截止仍为普通 `failed`）。
+* 下列情形**整次拒绝**（HTTP 409 `PREREQUISITE_NOT_ACCEPTABLE`，
+  旧关系、编排与修订历史不变），`conflicts[0].reason` 区分：
+
+| reason | 触发条件 |
+| --- | --- |
+| `TARGET_ALREADY_DEPARTED` | 目标组已出发（`fixed`/`awaiting_rescue`/`rescuing`/`rescued`） |
+| `SELF_DEPENDENCY` | 先导组就是目标组自身（禁止自依赖） |
+| `CYCLE_DETECTED` | 登记后形成环（含多级关系），响应给出 `cycle` 组号序列 |
+
+* 目标组或先导组不存在（422）、间隔为负（422，pydantic 校验）同样整次
+  拒绝。成功登记在同一事务内重排全部未出发组、写入一条
+  `group-prerequisites` 修订，HTTP 201 返回完整编排。
+* **场景重置**（`POST /scenario`）清空全部先导关系；旧修订保留。
+
+**GET /group-prerequisites** 按目标组编号升序列出全部关系及其实时放行
+依据：
+
+```json
+{
+  "current_minute": 0,
+  "relations": [
+    {"group_id": 2, "leader_group_id": 1, "release_gap": 3,
+     "release_basis": {
+       "satisfied": true,
+       "basis_type": "planned_arrival",
+       "leader_status": "scheduled",
+       "leader_arrival_minute": 6,
+       "earliest_release_minute": 9,
+       "reason": null}}
+  ]
+}
+```
+
+前置未满足时 `satisfied=false`、`basis_type`/`leader_arrival_minute`/
+`earliest_release_minute` 为 `null`，`reason` 给出上述 `LEADER_*` 原因码。
+
 **GET /passages/{edge_id}/load** 的响应逐分钟给出占用与该分钟的
 有效上限（管制时段内为 `min(原容量, 管制上限)`，时段外为原容量）；
 管制覆盖的分钟即使无占用也会列出（`used=0`），顶层 `capacity_controls`
@@ -373,8 +454,9 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### 修订历史（变更追溯）
 
-场景重置、新增人群组、纠正人群组、登记封闭、登记容量管制、现场节点滞留
-报告、**人工救援派遣与结案核销**、时间推进**成功**时，各产生一条修订：
+场景重置、新增人群组、纠正人群组、登记封闭、登记容量管制、**登记先导
+关系**、现场节点滞留报告、**人工救援派遣与结案核销**、时间推进**成功**
+时，各产生一条修订：
 全局递增修订号（按实际提交顺序编号）、触发操作及参数摘要、提交后的当前
 分钟、提交前后完整编排快照。**被拒绝的请求（409/422）不产生修订。**修订
 和编排变更在同一 SQLite 事务提交，查询不会看到只写入一方的状态；场景
@@ -397,12 +479,16 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 `operation`：`scenario`（场景重置）/ `groups`（新增人群组）/
 `group-corrections`（纠正人群组）/ `closures`（登记封闭）/
-`capacity-controls`（登记容量管制）/ `delay-reports`（现场节点滞留
+`capacity-controls`（登记容量管制）/
+`group-prerequisites`（登记先导关系）/ `delay-reports`（现场节点滞留
 报告）/ `rescue-dispatches`（人工救援派遣）/
 `rescue-completions`（救援结案核销）/ `tick`（时间推进）。
 纠正类修订的 `detail` 逐项记录纠正前后的字段值，形如
 `{"corrections": [{"group_id": 3, "changed_fields": ["size"],
-"before": {...}, "after": {...}}]}`；节点滞留报告的 `detail` 形如
+"before": {...}, "after": {...}}]}`；先导关系修订的 `detail` 形如
+`{"group_id": 2, "leader_group_id": 1, "release_gap": 3}`（替换旧关系时
+另附 `"replaced": {"leader_group_id": 4, "release_gap": 0}}`）；节点滞留
+报告的 `detail` 形如
 `{"group_id": 1, "node_id": 2, "recovery_minute": 6, "outcome": "resumed",
 "prefix_step_count": 1}`；派遣修订形如
 `{"task_id": 1, "group_id": 1, "team_id": 1, "node_id": 2,
@@ -434,9 +520,10 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 每组差异 `change`：`added`（新增，`before` 为 null）/ `removed`
 （移除，`after` 为 null）/ `changed`（`changed_fields` 列出变化的字段，
 `before`/`after` 给出状态、出发与到达分钟、路线、逐段时刻、已走前缀步数
-`prefix_step_count`、失败原因及人工救援字段
-`rescue_task_id/rescue_team_id/rescued_exit_id/delivery_minute` 的前后完整
-值）。未知修订号返回 HTTP 404 `{"detail": "修订号 N 不存在"}`。
+`prefix_step_count`、失败原因、人工救援字段
+`rescue_task_id/rescue_team_id/rescued_exit_id/delivery_minute` 及先导
+关系字段 `leader_group_id/release_gap/release_basis` 的前后完整值）。
+未知修订号返回 HTTP 404 `{"detail": "修订号 N 不存在"}`。
 
 ## 4. 调用示例
 
@@ -488,6 +575,15 @@ curl -s http://localhost:8000/rescue-tasks/1 | python3 -m json.tool
 curl -s -X POST http://localhost:8000/rescue-tasks/1/completion \
   -H 'Content-Type: application/json' \
   -d '{"exit_id": 6, "delivery_minute": 8}' | python3 -m json.tool
+
+# 登记先导关系：组2 须在先导组1 规划到达（或人工实际送达）3 分钟后才能放行
+curl -s -X POST http://localhost:8000/group-prerequisites \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2, "leader_group_id": 1, "release_gap": 3}' \
+  | python3 -m json.tool
+
+# 查询全部先导关系与实时放行依据
+curl -s http://localhost:8000/group-prerequisites | python3 -m json.tool
 ```
 
 ## 5. 编排语义（约定）
@@ -509,10 +605,10 @@ curl -s -X POST http://localhost:8000/rescue-tasks/1/completion \
    并列情形正确）。
 6. **推进与固定**：`/tick` 推进后，旧计划中出发分钟 `< 当前分钟` 的组
    立即视为已出发（`fixed`），路线与容量占用永久固定；其余未出发组
-   （含此前失败的组）以当前分钟为最早出发时间整体重排。被现场报告置为
-   待救援（`awaiting_rescue`）的组不参与重排，时间推进不会自动为其
-   重新规划；已交接人工救援（`rescuing`）与已人工送达（`rescued`）的
-   组同样不参与重排，由救援派遣/结案接口管理。
+   （含此前失败与前置未满足的组）以当前分钟为最早出发时间整体重排。被
+   现场报告置为待救援（`awaiting_rescue`）的组不参与重排，时间推进不会
+   自动为其重新规划；已交接人工救援（`rescuing`）与已人工送达
+   （`rescued`）的组同样不参与重排，由救援派遣/结案接口管理。
 7. **增量变更**：新增人群组或封闭时只重排未出发组；重排在单个 SQLite
    事务内“先整体删除旧路线、再写入新路线”，不会留下部分重排。
 8. **组纠正**：纠正清单整批校验、整批生效——任一项目标组不存在、
@@ -529,12 +625,12 @@ curl -s -X POST http://localhost:8000/rescue-tasks/1/completion \
    清除全部管制记录。
 11. **并发**：全部变更接口由同一把异步互斥锁串行化，容量逐组累加校验，
     并发变更不会超用容量。
-12. **修订**：九类变更（场景重置/新增组/纠正组/登记封闭/登记容量管制/
-    现场节点滞留报告/人工救援派遣/救援结案核销/推进时间）成功时，在同一
-    事务内追加修订记录（全局递增修订号、触发操作、当时分钟、前后完整
-    编排快照）；被拒绝的请求不产生修订，救援队登记也不产生修订。修订不
-    随场景重置或服务重启丢失，历史快照按落库内容原样返回，不按当前场景
-    重算。
+12. **修订**：十类变更（场景重置/新增组/纠正组/登记封闭/登记容量管制/
+    登记先导关系/现场节点滞留报告/人工救援派遣/救援结案核销/推进时间）
+    成功时，在同一事务内追加修订记录（全局递增修订号、触发操作、当时
+    分钟、前后完整编排快照）；被拒绝的请求不产生修订，救援队登记也不
+    产生修订。修订不随场景重置或服务重启丢失，历史快照按落库内容原样
+    返回，不按当前场景重算。
 13. **现场节点滞留报告**：仅当该组按现行计划已到达所报节点、尚未进入
     下一通道且未抵达出口时受理（下一通道进入分钟 == 当前分钟仍视为在
     节点；恢复分钟不得早于当前分钟）；组未出发、节点或时机不符一律拒绝
@@ -558,18 +654,34 @@ curl -s -X POST http://localhost:8000/rescue-tasks/1/completion \
     出口与时刻单列（不回写规划到达字段）。成功派遣与结案均与修订在同一
     事务原子写入。场景重置清空全部救援队与任务，旧修订保留、编号继续
     递增。
+15. **先导组放行间隔**：现场可为尚未出发的组登记一个先导组与非负放行
+    间隔，同一组至多一项关系、再次登记替换旧关系；先导组须存在，禁止
+    自依赖与成环（登记时以替换后的关系图做环检测），目标组已出发、编号
+    或间隔无效、形成环时整次拒绝，计划与修订历史不变。后继组的可出发
+    分钟不早于自身最早出发分钟及**先导组规划到达分钟 + 间隔**；先导组
+    已由人工救援结案送达时改用**实际送达分钟 + 间隔**。先导待救援、救援
+    中、尚未安排、无可行路线或先导自身前置未满足时，后继标记
+    `blocked`（前置未满足）：不写路线、不占通道；阻塞沿多级关系传递，
+    先导落定后的下一次重排自动转正。多级关系**按依赖顺序安排**：每轮先
+    在可安排组（无先导或先导已有可用到达锚点）中沿用优先级、最早出发
+    分钟、组编号与路线并列规则逐组贪婪安排；截止、封闭与容量约束照常
+    生效，前置满足但自身赶不上截止的组仍为普通 `failed`。关系变更、
+    时间推进、现场滞留及救援结案后立即重排未出发组；已出发组路线及既有
+    放行决定不追溯。成功登记在同一事务原子写入一条
+    `group-prerequisites` 修订（替换时 `detail.replaced` 记录旧关系）；
+    场景重置清空全部先导关系。
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排与拒绝逻辑、现场滞留报告、人工救援队派遣/结案、修订记录与差异
+  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、修订记录与差异
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
-  db.py         SQLite 建表、世界状态加载、整组事务化持久化、滞留报告与修订落库
+  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告与修订落库
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
 examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发/修订历史集成测试（pytest）
+tests/          算法单元测试与 API/并发/修订历史/先导关系集成测试（pytest）
 ```
 
 本地运行测试：

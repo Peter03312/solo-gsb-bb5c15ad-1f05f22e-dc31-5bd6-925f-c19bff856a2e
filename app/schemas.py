@@ -72,6 +72,48 @@ class DelayReportAliasIn(DelayReportIn):
 
 
 # --------------------------------------------------------------------------
+# 先导关系（放行前置）
+# --------------------------------------------------------------------------
+
+class PrerequisiteIn(BaseModel):
+    """为尚未出发的人群组登记先导组与非负放行间隔（每组至多一项）。"""
+    group_id: int = Field(..., ge=1, description="后继（目标）人群组编号，须尚未出发")
+    leader_group_id: int = Field(..., ge=1, description="先导组编号（须存在）")
+    release_gap: int = Field(
+        ..., ge=0, description="非负放行间隔：后继不早于先导到达分钟 + 该间隔")
+
+
+class PrerequisiteBasisOut(BaseModel):
+    """后继组当前的放行依据（实时由先导组状态计算）。"""
+    satisfied: bool = Field(
+        description="先导是否已有可用的到达锚点（规划到达或人工实际送达）")
+    # planned_arrival=先导规划到达分钟；actual_delivery=先导人工救援实际送达
+    # 分钟；前置未满足时为 null
+    basis_type: Optional[str] = None
+    leader_status: str = Field(description="计算放行依据时先导组的状态")
+    leader_arrival_minute: Optional[int] = Field(
+        None, description="放行依据采用的先导到达/实际送达分钟")
+    earliest_release_minute: Optional[int] = Field(
+        None, description="先导到达分钟 + 放行间隔（未满足时为 null）")
+    # 未满足时给出原因：LEADER_PENDING / LEADER_AWAITING_RESCUE /
+    # LEADER_RESCUING / LEADER_FAILED / LEADER_BLOCKED
+    reason: Optional[str] = None
+
+
+class PrerequisiteOut(BaseModel):
+    group_id: int
+    leader_group_id: int
+    release_gap: int
+    release_basis: PrerequisiteBasisOut = Field(
+        description="该关系当前的放行依据（先导状态、采用的到达分钟与最早放行分钟）")
+
+
+class PrerequisiteListOut(BaseModel):
+    current_minute: int
+    relations: list[PrerequisiteOut]
+
+
+# --------------------------------------------------------------------------
 # 人工救援队与救援任务
 # --------------------------------------------------------------------------
 
@@ -209,6 +251,13 @@ class GroupPlanOut(BaseModel):
         None, description="结案单列的实际送达出口（非规划到达，rescued 时给出）")
     delivery_minute: Optional[int] = Field(
         None, description="结案单列的实际送达分钟（可晚于原截止，rescued 时给出）")
+    # ---- 先导关系（仅登记过先导的组给出，其余恒为 null，字段语义兼容）----
+    leader_group_id: Optional[int] = Field(
+        None, description="先导组编号（后继组最早放行分钟的前置）")
+    release_gap: Optional[int] = Field(
+        None, description="非负放行间隔：最早放行=先导到达分钟+该间隔")
+    release_basis: Optional[PrerequisiteBasisOut] = Field(
+        None, description="当前放行依据：先导状态、采用的到达分钟与最早放行分钟")
 
 
 class PlanResponse(BaseModel):
@@ -247,6 +296,7 @@ class RevisionSummaryOut(BaseModel):
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
                     "group-corrections=纠正人群组 | closures=登记封闭 | "
                     "capacity-controls=登记容量管制 | "
+                    "group-prerequisites=登记先导关系 | "
                     "delay-reports=现场报告节点滞留 | "
                     "rescue-dispatches=派遣人工救援 | "
                     "rescue-completions=救援结案核销 | tick=时间推进")
