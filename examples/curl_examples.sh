@@ -3,7 +3,8 @@
 # 用法： bash examples/curl_examples.sh [BASE_URL]
 # 依次演示：初始化、新增组、新增封闭、推进分钟、409 拒绝、容量管制登记/
 # 重叠/超载拒绝、有效上限核验、组纠正、现场节点滞留报告（受理/拒绝/待救援）、
-# 人工救援队登记/派遣拒绝/派遣受理/结案核销、修订追溯。
+# 人工救援队登记/派遣拒绝/派遣受理/结案核销、先导组放行关系（登记/替换/
+# 拒绝/前置未满足/救援结案放行）、修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -275,5 +276,117 @@ curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/revisions/999999"
 python3 -m json.tool /tmp/resp.json || true
 curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/rescue-tasks/999999"
 python3 -m json.tool /tmp/resp.json || true
+
+# ---- 先导组放行关系：登记 / 替换 / 拒绝 / 前置未满足 / 结案放行 ----
+say "42) 重置为链式小场景（1 -e1-> 2 -e2-> 出口6），组1到达6、组2/组3随后"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 30},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 30}
+    ],
+    "exits": [6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 40},
+      {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 5, "deadline": 40},
+      {"id": 3, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 1, "deadline": 40}
+    ]
+  }' > /dev/null
+curl -s "$BASE/plan" | python3 -m json.tool
+
+say "43) 登记先导关系：组2 跟随 组1、放行间隔 3（组2 可出发分钟 = 6+3 = 9）"
+curl -s -X POST "$BASE/group-dependencies" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2, "pioneer_group_id": 1, "release_interval": 3}' \
+  | python3 -m json.tool
+
+say "44) 多级关系：组3 跟随 组2、间隔 2（按依赖顺序逐轮安排，组3 第 17 分钟出发）"
+curl -s -X POST "$BASE/group-dependencies" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 3, "pioneer_group_id": 2, "release_interval": 2}' \
+  | python3 -m json.tool
+
+say "45) 查询全部先导关系（先导状态 + 放行依据分钟）"
+curl -s "$BASE/group-dependencies" | python3 -m json.tool
+
+say "46) 再次登记替换旧关系：组2 间隔 3 -> 0（可出发分钟变为 6）"
+curl -s -X POST "$BASE/group-dependencies" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2, "pioneer_group_id": 1, "release_interval": 0}' \
+  | python3 -m json.tool
+
+say "47) 自依赖 / 成环 / 不存在的先导组（预期 409 SELF_DEPENDENCY、409 CYCLE、422）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/group-dependencies" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2, "pioneer_group_id": 2, "release_interval": 1}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/group-dependencies" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "pioneer_group_id": 3, "release_interval": 1}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/group-dependencies" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2, "pioneer_group_id": 999, "release_interval": 1}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "48) 前置未满足：先导待救援时后继不占通道；救援结案后按实际送达分钟放行"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 1, "capacity": 10}
+    ],
+    "exits": [6],
+    "closures": [{"edge_id": 2, "start_minute": 5, "end_minute": 30}],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30},
+      {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 5, "deadline": 40}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/group-dependencies" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 2, "pioneer_group_id": 1, "release_interval": 2}' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 4}' > /dev/null
+curl -s -X POST "$BASE/groups/1/delay-report" \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 6}' | python3 -m json.tool
+
+say "49) 派遣组1 给救援队1（组2 仍前置未满足：先导救援中）"
+curl -s -X POST "$BASE/rescue-teams" -H 'Content-Type: application/json' \
+  -d '{"team_id": 1, "capacity": 10}' > /dev/null
+curl -s -X POST "$BASE/rescue-tasks" -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 1, "node_id": 2, "observed_minute": 4}' \
+  > /tmp/dispatch.json
+python3 -m json.tool /tmp/dispatch.json
+TASK_ID=$(python3 -c 'import json; print(json.load(open("/tmp/dispatch.json"))["task_id"])')
+curl -s "$BASE/group-dependencies" | python3 -m json.tool
+
+say "50) 推进到第 10 分钟并结案（实际送达 10）：组2 立即按 10+2=12 放行"
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 6}' > /dev/null
+curl -s -X POST "$BASE/rescue-tasks/$TASK_ID/completion" \
+  -H 'Content-Type: application/json' \
+  -d '{"exit_id": 6, "delivery_minute": 10}' | python3 -m json.tool
+curl -s "$BASE/plan" | python3 -m json.tool
+
+say "51) 场景重置清空全部先导关系"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{"passages": [{"id": 1, "src": 1, "dst": 6, "minutes": 1, "capacity": 10}],
+       "exits": [6], "closures": [],
+       "groups": [{"id": 1, "size": 1, "origin": 1, "earliest_departure": 0,
+                   "priority": 1, "deadline": 10}]}' > /dev/null
+curl -s "$BASE/group-dependencies" | python3 -m json.tool
+
+say "52) 修订历史中的 group-dependencies 条目（含被替换的旧关系）"
+curl -s "$BASE/revisions" | python3 -c \
+  'import json,sys
+for r in json.load(sys.stdin)["revisions"]:
+    if r["operation"] == "group-dependencies":
+        print(json.dumps(r, ensure_ascii=False))'
 
 say "完成。交互文档： $BASE/docs"

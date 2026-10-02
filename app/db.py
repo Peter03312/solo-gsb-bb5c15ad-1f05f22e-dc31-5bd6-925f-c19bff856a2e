@@ -81,6 +81,16 @@ CREATE TABLE IF NOT EXISTS delay_reports (
     prefix_step_count INTEGER NOT NULL
 );
 
+-- 先导组放行关系：每个后继组最多一项（再次登记替换旧关系）。
+-- 后继组的可出发分钟不早于自身最早出发分钟，也不早于先导组规划到达
+-- 分钟（先导组已人工救援送达时为实际送达分钟）加非负放行间隔；
+-- 先导组待救援、救援中或无可行路线时，后继标记前置未满足、不占通道。
+CREATE TABLE IF NOT EXISTS group_dependencies (
+    group_id         INTEGER PRIMARY KEY,  -- 后继组编号（每组最多一项关系）
+    pioneer_id       INTEGER NOT NULL,     -- 先导组编号
+    release_interval INTEGER NOT NULL      -- 非负放行间隔（分钟）
+);
+
 -- 人工救援队：按唯一编号登记，capacity 为正整数载员量。
 -- 队伍是否空闲由 rescue_tasks 中是否存在该队 in_progress 任务决定。
 CREATE TABLE IF NOT EXISTS rescue_teams (
@@ -110,14 +120,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_rescue_tasks_open_team
     ON rescue_tasks(team_id) WHERE status='in_progress';
 
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
--- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
+-- 登记容量管制/登记先导组放行关系/现场节点滞留报告/人工救援派遣/
+-- 救援结案核销/推进时间）与编排变更在同一事务内写入；
 -- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
 -- 场景重置（reset_db）与服务重启均不影响本表。
 CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
                                       -- closures | capacity-controls |
-                                      -- delay-reports | rescue-dispatches |
+                                      -- group-dependencies | delay-reports |
+                                      -- rescue-dispatches |
                                       -- rescue-completions | tick
     detail      TEXT NOT NULL,        -- JSON：触发操作的参数摘要
     minute      INTEGER NOT NULL,     -- 该修订提交后的当前分钟
@@ -140,8 +152,9 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    # 人工救援队与其救援任务随场景重置清空；修订历史不在清空之列
-    for table in ("rescue_tasks", "rescue_teams",
+    # 人工救援队与其救援任务、先导组放行关系随场景重置清空；
+    # 修订历史不在清空之列
+    for table in ("rescue_tasks", "rescue_teams", "group_dependencies",
                   "delay_reports", "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
@@ -341,6 +354,45 @@ async def upsert_delay_report(db: aiosqlite.Connection, *, group_id: int,
                prefix_step_count=excluded.prefix_step_count""",
         (group_id, node_id, recovery_minute, reported_minute,
          prefix_step_count))
+
+
+# --------------------------------------------------------------------------
+# 先导组放行关系
+# --------------------------------------------------------------------------
+
+async def load_dependencies(db: aiosqlite.Connection) -> dict[int, dict]:
+    """返回 后继组号 -> {"pioneer_id", "release_interval"}（全部关系）。"""
+    async with db.execute(
+            "SELECT group_id, pioneer_id, release_interval "
+            "FROM group_dependencies") as cur:
+        rows = await cur.fetchall()
+    return {gid: {"pioneer_id": pid, "release_interval": interval}
+            for gid, pid, interval in rows}
+
+
+async def upsert_dependency(db: aiosqlite.Connection, *, group_id: int,
+                            pioneer_id: int, release_interval: int) -> None:
+    """登记/替换一组的先导组放行关系（调用方负责事务与全部校验）。"""
+    await db.execute(
+        """INSERT INTO group_dependencies(group_id, pioneer_id,
+                                          release_interval)
+           VALUES(?,?,?)
+           ON CONFLICT(group_id) DO UPDATE SET
+               pioneer_id=excluded.pioneer_id,
+               release_interval=excluded.release_interval""",
+        (group_id, pioneer_id, release_interval))
+
+
+async def load_group_states(db: aiosqlite.Connection) -> dict[int, dict]:
+    """返回 group_id -> {"status", "arrival_minute"}（全部组）。
+
+    供先导组放行依据判定：先导组 scheduled/fixed 时取其规划到达分钟；
+    其余状态（待救援/救援中/已救援）由服务层结合救援任务表判定。
+    """
+    async with db.execute("SELECT id, status, arrival_minute FROM groups") as cur:
+        rows = await cur.fetchall()
+    return {gid: {"status": status, "arrival_minute": arrival}
+            for gid, status, arrival in rows}
 
 
 # --------------------------------------------------------------------------

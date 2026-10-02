@@ -34,19 +34,24 @@ def show(title, status, payload):
 def summarize(plan):
     print(f"\n当前分钟: {plan['current_minute']}")
     for g in plan["groups"]:
+        dep = (f"  先导组 {g['pioneer_group_id']}"
+               f"（间隔 {g['release_interval']}，"
+               f"放行依据 {g['release_after_minute']}）"
+               if g.get("pioneer_group_id") is not None else "")
         if g["status"] in ("scheduled", "fixed"):
             print(f"  组 {g['group_id']:>2} [{g['status']:>9}] "
                   f"出口 {g['exit_id']}  出发 {g['departure_minute']:>3} "
                   f"到达 {g['arrival_minute']:>3}  通道序列 {g['route']}"
                   + (f"  已走前缀 {g['prefix_step_count']} 段"
-                     if g.get("prefix_step_count") is not None else ""))
+                     if g.get("prefix_step_count") is not None else "")
+                  + dep)
         elif g["status"] == "awaiting_rescue":
             print(f"  组 {g['group_id']:>2} [待救援    ] "
                   f"滞留于已走前缀（{g['prefix_step_count']} 段，"
                   f"通道序列 {g['route']}）原因 {g['reason']}：{g['detail']}")
         else:
             print(f"  组 {g['group_id']:>2} [{g['status']:>9}] "
-                  f"原因 {g['reason']}：{g['detail']}")
+                  f"原因 {g['reason']}：{g['detail']}{dep}")
 
 
 if __name__ == "__main__":
@@ -325,3 +330,109 @@ if __name__ == "__main__":
 
     status, payload = call("GET", "/revisions/999999")
     show("未知修订号（预期 404）", status, payload)
+
+    # ---- 先导组放行关系：登记 / 替换 / 拒绝 / 前置未满足 / 结案放行 ----
+    # 链式场景：1 -e1(4min)-> 2 -e2(2min)-> 出口6；组 1 第 6 分钟到达
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 30},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 30},
+        ],
+        "exits": [6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 40},
+            {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 5, "deadline": 40},
+            {"id": 3, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 1, "deadline": 40},
+        ],
+    })
+    assert status == 200
+
+    # 登记：组 2 跟随组 1、放行间隔 3 -> 组 2 可出发分钟 = 6+3 = 9；
+    # 多级：组 3 跟随组 2、间隔 2 -> 按依赖顺序逐轮安排，第 17 分钟出发
+    status, plan = call("POST", "/group-dependencies",
+                        {"group_id": 2, "pioneer_group_id": 1,
+                         "release_interval": 3})
+    show("登记先导关系：组2 跟随 组1、间隔 3", status, plan)
+    status, plan = call("POST", "/group-dependencies",
+                        {"group_id": 3, "pioneer_group_id": 2,
+                         "release_interval": 2})
+    show("多级关系：组3 跟随 组2、间隔 2（按依赖顺序逐轮安排）",
+         status, plan)
+    summarize(plan)
+
+    status, payload = call("GET", "/group-dependencies")
+    show("全部先导关系（先导状态 + 放行依据分钟）", status, payload)
+
+    # 再次登记替换旧关系：组 2 间隔 3 -> 0
+    status, plan = call("POST", "/group-dependencies",
+                        {"group_id": 2, "pioneer_group_id": 1,
+                         "release_interval": 0})
+    show("替换旧关系：组2 间隔 3 -> 0（可出发分钟变为 6）", status, plan)
+    summarize(plan)
+
+    # 自依赖 / 成环 / 不存在的先导组：整次拒绝，计划与修订历史不变
+    status, payload = call("POST", "/group-dependencies",
+                           {"group_id": 2, "pioneer_group_id": 2,
+                            "release_interval": 1})
+    show("自依赖（预期 409 SELF_DEPENDENCY）", status, payload)
+    status, payload = call("POST", "/group-dependencies",
+                           {"group_id": 1, "pioneer_group_id": 3,
+                            "release_interval": 1})
+    show("成环（预期 409 CYCLE，chain 给出成环链条）", status, payload)
+    status, payload = call("POST", "/group-dependencies",
+                           {"group_id": 2, "pioneer_group_id": 999,
+                            "release_interval": 1})
+    show("先导组不存在（预期 422）", status, payload)
+
+    # 前置未满足与结案放行：先导待救援/救援中时后继不占通道，
+    # 救援结案后按实际送达分钟 + 间隔放行
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 1, "capacity": 10},
+        ],
+        "exits": [6],
+        "closures": [{"edge_id": 2, "start_minute": 5, "end_minute": 30}],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            {"id": 2, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 5, "deadline": 40}],
+    })
+    assert status == 200
+    call("POST", "/group-dependencies",
+         {"group_id": 2, "pioneer_group_id": 1, "release_interval": 2})
+    call("POST", "/tick", {"minutes": 4})
+    status, plan = call("POST", "/groups/1/delay-report",
+                        {"node_id": 2, "recovery_minute": 6})
+    show("先导组 1 待救援：后继组 2 前置未满足、不占通道", status, plan)
+    summarize(plan)
+
+    call("POST", "/rescue-teams", {"team_id": 1, "capacity": 10})
+    status, task = call("POST", "/rescue-tasks",
+                        {"group_id": 1, "team_id": 1, "node_id": 2,
+                         "observed_minute": 4})
+    assert status == 201
+    status, payload = call("GET", "/group-dependencies")
+    show("先导救援中：放行依据仍为 null", status, payload)
+
+    call("POST", "/tick", {"minutes": 6})  # 当前分钟 10
+    status, task = call("POST", f"/rescue-tasks/{task['task_id']}/completion",
+                        {"exit_id": 6, "delivery_minute": 10})
+    show("救援结案（实际送达 10）", status, task)
+    status, plan = call("GET", "/plan")
+    show("结案后立即重排：组 2 按 10+2=12 放行", status, plan)
+    summarize(plan)
+
+    # 场景重置清空全部先导关系
+    call("POST", "/scenario", {
+        "passages": [{"id": 1, "src": 1, "dst": 6, "minutes": 1,
+                      "capacity": 10}],
+        "exits": [6], "closures": [],
+        "groups": [{"id": 1, "size": 1, "origin": 1,
+                    "earliest_departure": 0, "priority": 1, "deadline": 10}]})
+    status, payload = call("GET", "/group-dependencies")
+    show("场景重置后先导关系已清空", status, payload)

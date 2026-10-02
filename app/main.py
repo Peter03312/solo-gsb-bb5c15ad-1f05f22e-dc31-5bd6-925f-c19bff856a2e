@@ -26,6 +26,12 @@
   滞留报告对其拒绝）。结案须给出既有出口与不早于派遣、不晚于当前分钟的
   实际送达分钟：核销后队伍空闲、组置已救援，实际出口与时刻单列，
   不当作规划到达。无效编号、状态/时序冲突与并发抢占均整次拒绝。
+* 现场可为尚未出发的组登记先导组与非负放行间隔（每组最多一项，再次
+  登记替换旧关系；先导组须存在，禁止自依赖与成环）：后继组的可出发
+  分钟不早于自身最早出发分钟及先导组规划到达分钟（已人工送达为实际
+  送达分钟）加间隔；先导待救援、救援中或无可行路线时后继标记前置
+  未满足、不占通道。关系变更、时间推进、现场滞留报告与救援结案后
+  立即按依赖顺序重排未出发组，已出发组路线与既有放行决定不追溯。
 
 修订历史
 ========
@@ -51,12 +57,13 @@ from .planner import effective_capacity, plan_group
 from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
                       DelayReportAliasIn, DelayReportIn, GroupChangeOut,
-                      GroupCorrectionIn, GroupIn, GroupPlanOut,
-                      PlanResponse, RescueCompletionIn, RescueDispatchIn,
-                      RescueTaskListOut, RescueTaskOut, RescueTeamIn,
-                      RescueTeamListOut, RescueTeamOut, RevisionDetailOut,
-                      RevisionListOut, RevisionSummaryOut, ScenarioIn,
-                      StepOut)
+                      GroupCorrectionIn, GroupDependencyIn,
+                      GroupDependencyListOut, GroupDependencyOut, GroupIn,
+                      GroupPlanOut, PlanResponse, RescueCompletionIn,
+                      RescueDispatchIn, RescueTaskListOut, RescueTaskOut,
+                      RescueTeamIn, RescueTeamListOut, RescueTeamOut,
+                      RevisionDetailOut, RevisionListOut, RevisionSummaryOut,
+                      ScenarioIn, StepOut)
 from .seed import SEED_SCENARIO
 
 DB_PATH = os.getenv("EVAC_DB_PATH", "/data/evacuation.db")
@@ -88,10 +95,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.3.0",
+    version="1.4.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
-                "现场节点滞留报告与人工救援队交接核销。",
+                "现场节点滞留报告、人工救援队交接核销与先导组放行关系。",
     lifespan=lifespan,
 )
 
@@ -155,12 +162,42 @@ async def _load_scenario(conn: aiosqlite.Connection,
     return after
 
 
+# 先导组前置未满足时，面向后继组的原因说明（按先导当前状态区分）
+_PRECURSOR_UNMET_DETAIL = {
+    "awaiting_rescue":
+        "先导组 {pid} 待救援，前置未满足，本组暂不安排、不占用通道",
+    "rescuing":
+        "先导组 {pid} 救援中，前置未满足，本组暂不安排、不占用通道",
+    "unschedulable":
+        "先导组 {pid} 无可行路线，前置未满足，本组暂不安排、不占用通道",
+    "missing":
+        "先导组 {pid} 不存在，前置未满足，本组暂不安排、不占用通道",
+    "cycle":
+        "先导组 {pid} 的关系链异常成环，前置未满足，本组暂不安排、不占用通道",
+}
+
+
+def _precursor_unmet_result(group_id: int, pioneer_id: int,
+                            cause: str) -> dict:
+    """构造"前置未满足"的编排结果：不占通道，随下轮重排再次判定。"""
+    detail = _PRECURSOR_UNMET_DETAIL.get(
+        cause, _PRECURSOR_UNMET_DETAIL["missing"]).format(pid=pioneer_id)
+    return {"group_id": group_id, "status": "failed",
+            "reason": "PRECURSOR_UNMET", "detail": detail}
+
+
 async def _replan_pending(conn: aiosqlite.Connection,
                           in_transaction: bool = False) -> None:
     """重排全部未出发组（scheduled/failed/pending），整体替换。
 
     读阶段在事务外完成（SQLite autocommit 下读到的是最近一致快照），
     写阶段整体置于一个事务中，杜绝部分重排。
+
+    先导组放行关系按依赖顺序逐轮安排：每轮在"可安排"的组（无先导关系，
+    或先导组本轮/既有结论已确定）中沿用现有优先级、最早出发分钟、组编号
+    排序逐组编排；后继组的可出发分钟不早于自身最早出发分钟及先导组规划
+    到达分钟（先导已人工送达为实际送达分钟）加放行间隔；先导待救援、
+    救援中或无可行路线时，后继标记前置未满足、不占通道。
     """
     minute_now = await db.get_current_minute(conn)
     world, pending = await db.load_world(conn)
@@ -174,18 +211,96 @@ async def _replan_pending(conn: aiosqlite.Connection,
         if g["origin"] not in node_set:
             raise HTTPException(422, f"组 {g['id']} 的起点 {g['origin']} 不连通")
 
-    results = []
-    # 已按 优先级 DESC, 最早出发 ASC, 组编号 ASC 排序
+    deps = await db.load_dependencies(conn)
+    if deps:
+        states = await db.load_group_states(conn)
+        rescue_by_group = await db.load_group_rescue_map(conn)
+    else:
+        states, rescue_by_group = {}, {}
+    pending_ids = {g["id"] for g in pending}
+
+    # 先导结论：组号 -> ("basis", 放行依据分钟) | ("unmet", 先导状态/原因)
+    resolved: dict[int, tuple] = {}
+
+    def settled_pioneer_conclusion(pid: int) -> tuple:
+        """先导组不在本轮待重排集合（已出发/待救援/救援中/已救援）时的结论。"""
+        info = states.get(pid)
+        if info is None:  # 防御：登记时已校验先导组存在
+            return ("unmet", "missing")
+        status = info["status"]
+        if status == "fixed" and info["arrival_minute"] is not None:
+            return ("basis", info["arrival_minute"])
+        if status == "rescued":
+            delivery = (rescue_by_group.get(pid) or {}).get("delivery_minute")
+            if delivery is not None:
+                return ("basis", delivery)
+            return ("unmet", status)
+        # awaiting_rescue / rescuing：前置未满足
+        return ("unmet", status)
+
+    # 预置：先导不在本轮待重排集合中的关系立即有结论
     for g in pending:
-        result = plan_group(
-            group_id=g["id"], size=g["size"], origin=g["origin"],
-            earliest_departure=g["earliest_departure"],
-            deadline=g["deadline"], current_minute=minute_now, world=world)
-        results.append(result)
-        if result["status"] == "scheduled":
-            for (eid, minute), add in result["load_delta"].items():
-                key = (eid, minute)
-                world.fixed_load[key] = world.fixed_load.get(key, 0) + add
+        dep = deps.get(g["id"])
+        if dep is not None and dep["pioneer_id"] not in pending_ids:
+            resolved[dep["pioneer_id"]] = settled_pioneer_conclusion(
+                dep["pioneer_id"])
+
+    results = []
+    remaining = {g["id"]: g for g in pending}
+    while remaining:
+        # 本轮可安排：无先导关系，或先导结论已确定
+        ready = [g for gid, g in remaining.items()
+                 if deps.get(gid) is None
+                 or deps[gid]["pioneer_id"] in resolved]
+        if not ready:
+            # 防御：登记时已禁止成环，正常不会到达；按前置未满足收尾
+            for gid, g in remaining.items():
+                results.append(_precursor_unmet_result(
+                    gid, deps[gid]["pioneer_id"], "cycle"))
+            break
+        # 沿用现有排序：优先级 DESC、最早出发分钟 ASC、组编号 ASC
+        ready.sort(key=lambda g: (-g["priority"], g["earliest_departure"],
+                                  g["id"]))
+        for g in ready:
+            gid = g["id"]
+            dep = deps.get(gid)
+            conclusion = resolved[dep["pioneer_id"]] if dep else None
+            if conclusion is not None and conclusion[0] == "unmet":
+                result = _precursor_unmet_result(
+                    gid, dep["pioneer_id"], conclusion[1])
+            else:
+                earliest = g["earliest_departure"]
+                if conclusion is not None:  # ("basis", 放行依据分钟)
+                    earliest = max(
+                        earliest, conclusion[1] + dep["release_interval"])
+                result = plan_group(
+                    group_id=gid, size=g["size"], origin=g["origin"],
+                    earliest_departure=earliest, deadline=g["deadline"],
+                    current_minute=minute_now, world=world)
+                if result["status"] == "scheduled":
+                    for (eid, minute), add in result["load_delta"].items():
+                        key = (eid, minute)
+                        world.fixed_load[key] = \
+                            world.fixed_load.get(key, 0) + add
+                elif (conclusion is not None
+                      and result["reason"] == "DEADLINE_PASSED"
+                      and conclusion[1] + dep["release_interval"]
+                      > g["deadline"]):
+                    # 放行依据本身已晚于截止：说明真实原因而非笼统的"当前分钟"
+                    result["detail"] = (
+                        f"放行依据分钟 "
+                        f"{conclusion[1] + dep['release_interval']}"
+                        f"（先导组 {dep['pioneer_id']} 到达 {conclusion[1]} "
+                        f"+ 放行间隔 {dep['release_interval']}）已晚于规划截止"
+                        f"分钟 {g['deadline']}，截止前没有可安排的路线")
+            results.append(result)
+            # 本组结论供其后继判定：已安排 -> 放行依据为规划到达分钟；
+            # 未安排（无可行路线）-> 后继前置未满足
+            if result["status"] == "scheduled":
+                resolved[gid] = ("basis", result["arrival_minute"])
+            else:
+                resolved[gid] = ("unmet", "unschedulable")
+            del remaining[gid]
 
     if in_transaction:
         await db.persist_replan(conn, results, minute_now)
@@ -510,10 +625,46 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
 # 响应组装
 # --------------------------------------------------------------------------
 
+async def _release_basis_map(conn: aiosqlite.Connection) -> dict[int, dict]:
+    """返回 后继组号 -> 先导关系与当前放行依据（供 /plan 与关系查询展示）。
+
+    放行依据分钟 = 先导组规划到达分钟（scheduled/fixed）或人工实际送达
+    分钟（rescued）+ 放行间隔；先导待救援、救援中或无可行路线时为 None
+    （前置未满足）。与重排时使用的口径一致（固定组与已救援组的到达/送达
+    分钟不再变化，本轮新排组的到达分钟刚落库）。
+    """
+    deps = await db.load_dependencies(conn)
+    if not deps:
+        return {}
+    states = await db.load_group_states(conn)
+    rescue_by_group = await db.load_group_rescue_map(conn)
+    basis: dict[int, dict] = {}
+    for gid, dep in deps.items():
+        pid = dep["pioneer_id"]
+        info = states.get(pid)
+        pioneer_status = info["status"] if info is not None else "missing"
+        release_after = None
+        if info is not None:
+            if (info["status"] in ("scheduled", "fixed")
+                    and info["arrival_minute"] is not None):
+                release_after = info["arrival_minute"] + dep["release_interval"]
+            elif info["status"] == "rescued":
+                delivery = (rescue_by_group.get(pid) or {}).get(
+                    "delivery_minute")
+                if delivery is not None:
+                    release_after = delivery + dep["release_interval"]
+        basis[gid] = {"pioneer_group_id": pid,
+                      "release_interval": dep["release_interval"],
+                      "pioneer_status": pioneer_status,
+                      "release_after_minute": release_after}
+    return basis
+
+
 async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
     minute_now = await db.get_current_minute(conn)
     prefix_by_group = await db.load_delay_prefixes(conn)
     rescue_by_group = await db.load_group_rescue_map(conn)
+    basis_by_group = await _release_basis_map(conn)
     async with conn.execute(
             """SELECT id, status, departure_minute, arrival_minute, exit_id,
                       fail_reason, fail_detail
@@ -531,6 +682,7 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
                     edge_id=row[0], from_node=row[1], to_node=row[2],
                     enter_minute=row[3], exit_minute=row[4]))
         rescue = rescue_by_group.get(gid, {})
+        basis = basis_by_group.get(gid, {})
         out.append(GroupPlanOut(
             group_id=gid, status=status, exit_id=exit_id,
             departure_minute=dep, arrival_minute=arr,
@@ -540,7 +692,10 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
             rescue_task_id=rescue.get("rescue_task_id"),
             rescue_team_id=rescue.get("rescue_team_id"),
             rescued_exit_id=rescue.get("rescued_exit_id"),
-            delivery_minute=rescue.get("delivery_minute")))
+            delivery_minute=rescue.get("delivery_minute"),
+            pioneer_group_id=basis.get("pioneer_group_id"),
+            release_interval=basis.get("release_interval"),
+            release_after_minute=basis.get("release_after_minute")))
     return PlanResponse(current_minute=minute_now, groups=out)
 
 
@@ -554,7 +709,9 @@ _GROUP_DIFF_FIELDS = ("status", "exit_id", "departure_minute",
                       "arrival_minute", "route", "steps",
                       "prefix_step_count", "reason", "detail",
                       "rescue_task_id", "rescue_team_id",
-                      "rescued_exit_id", "delivery_minute")
+                      "rescued_exit_id", "delivery_minute",
+                      "pioneer_group_id", "release_interval",
+                      "release_after_minute")
 
 
 def _diff_plans(before: PlanResponse,
@@ -893,6 +1050,121 @@ async def list_capacity_controls(request: Request):
 
 
 # --------------------------------------------------------------------------
+# 先导组放行关系
+# --------------------------------------------------------------------------
+
+def _dependency_conflict(reason: str, message: str,
+                         payload: GroupDependencyIn,
+                         **extra) -> JSONResponse:
+    """构造统一的先导关系登记拒绝响应（HTTP 409 + error/message/conflicts）。"""
+    conflict = {"group_id": payload.group_id,
+                "pioneer_group_id": payload.pioneer_group_id,
+                "release_interval": payload.release_interval,
+                "reason": reason, **extra}
+    return JSONResponse(
+        status_code=409,
+        content={"error": "GROUP_DEPENDENCY_NOT_ACCEPTABLE",
+                 "message": message, "conflicts": [conflict]})
+
+
+@app.post("/group-dependencies", tags=["变更"], response_model=PlanResponse,
+          status_code=201,
+          responses={409: {"description": "目标组已出发、自依赖或成环，整次拒绝"},
+                     422: {"description": "组号或先导组号不存在、间隔无效"}})
+async def register_group_dependency(payload: GroupDependencyIn,
+                                    request: Request):
+    """为**尚未出发**的组登记先导组与非负放行间隔（每组最多一项，再次
+    登记替换旧关系）。
+
+    后继组的可出发分钟不早于自身最早出发分钟，也不早于先导组规划到达
+    分钟（先导组已人工救援送达时为实际送达分钟）加放行间隔；先导组
+    待救援、救援中或无可行路线时，后继组标记前置未满足（
+    ``PRECURSOR_UNMET``）、不占用通道，随后续重排再次判定。
+
+    先导组须已存在，禁止自依赖与成环；目标组已出发（
+    ``GROUP_DEPARTED``）、自依赖（``SELF_DEPENDENCY``）或形成环
+    （``CYCLE``）时整次拒绝（409），计划与修订历史不变；组号/先导组号
+    不存在或间隔为负返回 422。登记成功立即重排未出发组（已出发组路线
+    与既有放行决定不追溯），并原子写入一条 ``group-dependencies`` 修订，
+    返回重排后的完整编排（同 GET /plan）。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        states = await db.load_group_states(conn)
+        target = states.get(payload.group_id)
+        if target is None:
+            raise HTTPException(422, f"人群组 {payload.group_id} 不存在")
+        if payload.pioneer_group_id not in states:
+            raise HTTPException(
+                422, f"先导组 {payload.pioneer_group_id} 不存在")
+
+        if payload.group_id == payload.pioneer_group_id:
+            return _dependency_conflict(
+                "SELF_DEPENDENCY", "先导组不能是自身（禁止自依赖），整次拒绝",
+                payload)
+        if target["status"] in ("fixed", "awaiting_rescue",
+                                "rescuing", "rescued"):
+            return _dependency_conflict(
+                "GROUP_DEPARTED", "目标组已出发，不可登记先导关系，整次拒绝",
+                payload, status=target["status"])
+
+        # 成环检测：从先导组沿既有关系链回溯，若回到目标组则新关系成环
+        deps = await db.load_dependencies(conn)
+        chain = [payload.pioneer_group_id]
+        cur = payload.pioneer_group_id
+        visited = {payload.group_id, payload.pioneer_group_id}
+        while cur in deps:
+            cur = deps[cur]["pioneer_id"]
+            chain.append(cur)
+            if cur == payload.group_id:
+                return _dependency_conflict(
+                    "CYCLE", "登记后将形成先导关系环，整次拒绝",
+                    payload, chain=chain)
+            if cur in visited:  # 防御：既有数据异常成环（不含目标组）
+                break
+            visited.add(cur)
+
+        old = deps.get(payload.group_id)
+        before = await _build_plan_response(conn)
+        async with db.transaction(conn):
+            await db.upsert_dependency(
+                conn, group_id=payload.group_id,
+                pioneer_id=payload.pioneer_group_id,
+                release_interval=payload.release_interval)
+            await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            await db.insert_revision(
+                conn, "group-dependencies",
+                {"group_id": payload.group_id,
+                 "pioneer_group_id": payload.pioneer_group_id,
+                 "release_interval": payload.release_interval,
+                 "replaced": (
+                     {"pioneer_group_id": old["pioneer_id"],
+                      "release_interval": old["release_interval"]}
+                     if old is not None else None)},
+                _plan_dump(before), _plan_dump(after))
+        return after
+
+
+@app.get("/group-dependencies", tags=["查询"],
+         response_model=GroupDependencyListOut)
+async def list_group_dependencies(request: Request):
+    """列出当前全部先导组放行关系（按后继组号排序）。
+
+    每项给出先导组当前状态与放行依据分钟（先导组规划到达/实际送达分钟
+    + 放行间隔；前置未满足时为 null）。场景重置清空全部关系。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        basis = await _release_basis_map(conn)
+    return GroupDependencyListOut(
+        current_minute=minute_now,
+        dependencies=[GroupDependencyOut(group_id=gid, **basis[gid])
+                      for gid in sorted(basis)])
+
+
+# --------------------------------------------------------------------------
 # 现场节点滞留报告
 # --------------------------------------------------------------------------
 
@@ -1082,6 +1354,9 @@ async def _apply_rescue_dispatch(conn: aiosqlite.Connection,
         await conn.execute(
             "UPDATE groups SET status='rescuing', fail_reason=NULL, "
             "fail_detail=NULL WHERE id=?", (payload.group_id,))
+        # 先导状态由待救援转为救援中：重排未出发组，使其前置未满足的
+        # 判定与说明随先导状态同步（不占通道的结论不变）
+        await _replan_pending(conn, in_transaction=True)
         after = await _build_plan_response(conn)
         await db.insert_revision(
             conn, "rescue-dispatches",
@@ -1159,6 +1434,9 @@ async def _apply_rescue_completion(conn: aiosqlite.Connection,
         await conn.execute(
             "UPDATE groups SET status='rescued' WHERE id=?",
             (task["group_id"],))
+        # 已救援组的实际送达分钟即其先导放行依据：立即重排未出发组，
+        # 依赖该组的后继组按 送达分钟+放行间隔 重新判定
+        await _replan_pending(conn, in_transaction=True)
         after = await _build_plan_response(conn)
         await db.insert_revision(
             conn, "rescue-completions",
@@ -1230,7 +1508,8 @@ async def dispatch_rescue(payload: RescueDispatchIn, request: Request):
     且同组同队均无进行中任务时受理，返回任务号（201）。受理后组置
     ``rescuing``：保留已走通道前缀、不产生未来通道占用，时间推进不自动
     重排该组，其既有节点滞留报告接口被拒绝（409
-    ``GROUP_RESCUING``）。任一条件不符返回 409
+    ``GROUP_RESCUING``）；未出发组随之整体重排（以该组为先导的后继组
+    前置未满足的判定同步为先导"救援中"）。任一条件不符返回 409
     ``RESCUE_DISPATCH_NOT_ACCEPTABLE``（``conflicts[0].reason`` 给出
     OBSERVED_MINUTE_STALE / GROUP_NOT_AWAITING_RESCUE / NODE_MISMATCH /
     GROUP_RESCUE_IN_PROGRESS / TEAM_CAPACITY_EXCEEDED / TEAM_BUSY），
@@ -1287,8 +1566,9 @@ async def complete_rescue(task_id: int, payload: RescueCompletionIn,
     记录）。成功后任务置 completed、队伍立即空闲，组置 ``rescued``，实际
     出口与送达时刻在任务与编排中单列（``rescued_exit_id`` /
     ``delivery_minute``），**不**回写为规划到达（``exit_id`` /
-    ``arrival_minute`` 保持为空）。任务不存在 404；出口非既有出口 422；
-    任务已结案（``TASK_ALREADY_COMPLETED``）、送达早于派遣
+    ``arrival_minute`` 保持为空）；未出发组随之整体重排（以该组为先导的
+    后继组改按实际送达分钟 + 放行间隔判定放行）。任务不存在 404；出口非
+    既有出口 422；任务已结案（``TASK_ALREADY_COMPLETED``）、送达早于派遣
     （``DELIVERY_BEFORE_DISPATCH``）或晚于当前分钟（``DELIVERY_IN_FUTURE``）
     返回 409 ``RESCUE_COMPLETION_NOT_ACCEPTABLE``，整次拒绝。成功结案原子
     写入一条 ``rescue-completions`` 修订。

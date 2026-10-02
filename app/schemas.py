@@ -128,6 +128,35 @@ class RescueTaskListOut(BaseModel):
     tasks: list[RescueTaskOut]
 
 
+# --------------------------------------------------------------------------
+# 先导组放行关系
+# --------------------------------------------------------------------------
+
+class GroupDependencyIn(BaseModel):
+    """登记/替换一条先导组放行关系（同一组最多一项，再次登记替换旧关系）。"""
+    group_id: int = Field(..., ge=1, description="后继组编号（须尚未出发）")
+    pioneer_group_id: int = Field(..., ge=1,
+                                  description="先导组编号（须为已存在的组）")
+    release_interval: int = Field(
+        ..., ge=0, description="非负放行间隔（分钟）：先导组到达后至少间隔"
+                               "该分钟数后继组才可出发")
+
+
+class GroupDependencyOut(BaseModel):
+    group_id: int = Field(description="后继组编号")
+    pioneer_group_id: int = Field(description="先导组编号")
+    release_interval: int = Field(description="非负放行间隔（分钟）")
+    pioneer_status: str = Field(description="先导组当前状态")
+    release_after_minute: Optional[int] = Field(
+        None, description="放行依据分钟：先导组规划到达（已人工送达为实际"
+                          "送达）分钟 + 放行间隔；先导前置未满足时为 null")
+
+
+class GroupDependencyListOut(BaseModel):
+    current_minute: int
+    dependencies: list[GroupDependencyOut]
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")
@@ -209,6 +238,13 @@ class GroupPlanOut(BaseModel):
         None, description="结案单列的实际送达出口（非规划到达，rescued 时给出）")
     delivery_minute: Optional[int] = Field(
         None, description="结案单列的实际送达分钟（可晚于原截止，rescued 时给出）")
+    # ---- 先导组放行关系（仅登记了关系的组给出，其余恒为 null）----
+    pioneer_group_id: Optional[int] = Field(None, description="先导组编号")
+    release_interval: Optional[int] = Field(
+        None, description="非负放行间隔（分钟）")
+    release_after_minute: Optional[int] = Field(
+        None, description="放行依据分钟：先导组规划到达（已人工送达为实际"
+                          "送达）分钟 + 放行间隔；先导前置未满足时为 null")
 
 
 class PlanResponse(BaseModel):
@@ -247,6 +283,7 @@ class RevisionSummaryOut(BaseModel):
         description="触发操作：scenario=场景重置 | groups=新增人群组 | "
                     "group-corrections=纠正人群组 | closures=登记封闭 | "
                     "capacity-controls=登记容量管制 | "
+                    "group-dependencies=登记先导组放行关系 | "
                     "delay-reports=现场报告节点滞留 | "
                     "rescue-dispatches=派遣人工救援 | "
                     "rescue-completions=救援结案核销 | tick=时间推进")
